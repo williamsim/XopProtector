@@ -1,7 +1,8 @@
 # Changelog
 
-## 0.7.4 (hotfix 2026-10-11: zero fdsan in window + no linker patch on Android 16+)
+## 0.7.3 (hotfix 2026-10-11: Android 11/17 shell-init linker hardening)
 
+### Xiaomi 17 (HyperOS 4.0.0.9 / Android 17) — SIGILL: zero fdsan in loadLibrary window
 Xiaomi 17 (HyperOS 4.0.0.9 / Android 17) cloud test 2/2 SIGILL ~启动后立刻,
 `pc = linker64+0x8de60 (__loader_shared_globals)` — the trap stub, hit through
 `close() -> android_fdsan_close_with_tag` called from
@@ -20,7 +21,7 @@ Fix (window = shell constructor + JNI_OnLoad):
 - elf_util.cpp: `maps_raw_close` uses `syscall(__NR_close)`.
 - `install_linker_dobby_hooks_deferred`: inline linker patching now restricted
   to the VERIFIED MIDDLE WINDOW API 31..35 (Huawei A12 verified). API <= 30
-  was already forbidden (0.7.3, MIUI A11 soinfo-pool corruption); API >= 36
+  was already forbidden (Android 11 soinfo-pool corruption, below); API >= 36
   (Android 16+, incl. Xiaomi 17) now also forbidden — brand-new linker with
   unverified Dobby patterns + the fdsan trap above. Keyed SOs on API >= 36
   take the so_plain/lib_mirror plaintext path (ClassLoader pathElements
@@ -30,8 +31,7 @@ Fix (window = shell constructor + JNI_OnLoad):
 writes, zero stdio AND zero fdsan-touching libc calls (open/close/fopen/
 fdopen/fread/fclose) — raw syscalls only.
 
-## 0.7.3 (hotfix 2026-10-11: no linker code patch on Android 11 — MIUI soinfo corruption)
-
+### Redmi Note 9 Pro (MIUI 12.5.7 / Android 11) — SIGABRT: no inline linker patch
 - **Bug**: Redmi Note 9 Pro (MIUI 12.5.7 / Android 11) cloud test, 2/2 SIGABRT
   ~150 ms after shell init: `linker_soinfo.cpp:879: generate_handle CHECK
   'handle_ == 0' failed` inside a plain third-party `dlopen` (JPush
