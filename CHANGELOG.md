@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.2 (hotfix 2026-10-10: MIUI Android 11 startup livelock)
+
+- **Bug**: On Redmi Note 8 Pro (MIUI 12.5 / Android 11), the protected app hung
+  forever on the splash screen. Bugreport showed the main thread burning ~129 s
+  of CPU inside `dlopen_ext` while `libprotector.so`'s init_array ran.
+- **Root cause**: bytehook's own constructors (`bh_cfi_ctor` dlopen'ing
+  `libdl.so`, `bytesig_ctor` dlopen'ing `libc.so`) re-entered `do_dlopen`
+  while the OUTER dlopen (ART `System.loadLibrary` loading the shell itself)
+  was still in progress. MIUI's Android 11 linker livelocks on this
+  re-entrancy (dlopen of `libdl.so` in particular).
+- **Fix**: Both ctors now resolve their symbols with `dlsym(RTLD_DEFAULT, ...)`
+  — a pure symbol lookup that never touches the loader path. libc is in the
+  global group, so `__cfi_slowpath` / `__cfi_slowpath_diag` / `sigaction64` /
+  `sigprocmask64` resolve identically.
+- Rule: **no `dlopen()` from any init_array constructor**; constructor-time
+  symbol resolution must use `dlsym(RTLD_DEFAULT)` only.
+
 ## 0.7.2
 
 - Desktop / installer / packer jar / native version **0.7.2**.

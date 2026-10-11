@@ -22,7 +22,9 @@
 #include <cstdio>
 #include <dlfcn.h>
 #include <elf.h>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 namespace protector {
 
@@ -159,12 +161,17 @@ void decrypt_bitcode() {
 
 static void seed_rng() {
     unsigned seed = 0;
-    FILE* ur = fopen("/dev/urandom", "rb");
-    if (ur != nullptr) {
-        if (fread(&seed, 1, sizeof(seed), ur) != sizeof(seed)) {
+    // Android 17: fopen's PLT (fopen@LIBC) can mis-resolve to the linker's
+    // __loader_shared_globals trap stub when called from a constructor during
+    // System.loadLibrary, causing SIGILL. Use raw open/read/close instead of
+    // stdio here — this runs before the linker state is fully stable.
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t n = read(fd, &seed, sizeof(seed));
+        close(fd);
+        if (n != static_cast<ssize_t>(sizeof(seed))) {
             seed = 0;
         }
-        fclose(ur);
     }
     if (seed == 0) {
         seed = static_cast<unsigned>(time(nullptr))
@@ -199,6 +206,27 @@ void init_protector() {
     }
 #endif
     runtime_state().sdk_level = android_get_device_api_level();
+    // B1 bisect variant: restore constructor-time hook installation (original
+    // shell order). init_protector_late is NOT called from JNI_OnLoad anymore.
+    init_protector_late();
+    PLOGI("init_protector done in constructor (sdk=%d; hooks installed here)",
+          runtime_state().sdk_level);
+}
+
+/**
+ * Deferred init — called from JNI_OnLoad, after dlopen() has fully completed.
+ *
+ * Constructor-time (init_array) work is fragile on new Android versions:
+ * - Android 17: fopen's PLT can mis-resolve to the linker's
+ *   __loader_shared_globals trap stub during System.loadLibrary, SIGILL.
+ * - Android 14: constructor-time Dobby ELF parse can SEGV on APEX libart.
+ *
+ * Bytehook GOT rewriting, dlopen hooks, and background threads must run when
+ * the linker state is stable. JNI_OnLoad runs on the same thread right after
+ * dlopen returns, still before any business SO is loaded, so no hook coverage
+ * is lost.
+ */
+void init_protector_late() {
     // Early bytehook + dlopen hooks so business SOs loaded before initApp
     // are queued / decrypted once sokeys arrive (see --protect-so).
     protector::hook::ensure_bytehook();
@@ -206,7 +234,7 @@ void init_protector() {
     // Defer ART hooks to init_app — constructor-time Dobby ELF parse can SEGV on
     // some Android 14 / APEX libart layouts before the process is fully up.
     protector::risk::risk_checker().start();
-    PLOGI("init_protector done (ART hooks deferred; dlopen hooks early)");
+    PLOGI("init_protector_late done (ART hooks deferred; dlopen hooks installed)");
 }
 
 } // namespace protector

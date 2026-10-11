@@ -50,6 +50,28 @@ bool find_so_load_bias(const char* so_name, uintptr_t* out_bias);
  */
 bool read_maps_record(FILE* fp, std::string* line);
 
+/**
+ * XOP (2026-10-11): Android 17 traps fdsan during the System.loadLibrary
+ * window — BOTH fopen() and fdopen() call android_fdsan_exchange_owner_tag,
+ * which resolves through the linker's __loader_shared_globals trap stub
+ * (SIGILL). All early-startup (constructor / JNI_OnLoad) file reading must
+ * use raw read()/pread() with no stdio FILE* at all.
+ */
+struct MapsRawFile {
+    int fd = -1;
+    std::string buf;  // unconsumed bytes
+    bool eof = false;
+};
+
+/** openat("/proc/self/maps") without libc stdio. Close with maps_raw_close(). */
+MapsRawFile* maps_raw_open();
+
+/** Close a MapsRawFile opened by maps_raw_open(). nullptr-safe. */
+void maps_raw_close(MapsRawFile* mf);
+
+/** Same line semantics as the FILE* overload, but raw read() based. */
+bool read_maps_record(MapsRawFile* mf, std::string* line);
+
 /** Pathname after the inode field, including spaces. False if anonymous. */
 bool maps_pathname(const std::string& line, std::string* path);
 

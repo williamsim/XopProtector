@@ -42,12 +42,14 @@ static void *bh_cfi_slowpath = NULL;
 static void *bh_cfi_slowpath_diag = NULL;
 
 __attribute__((constructor)) static void bh_cfi_ctor(void) {
-  void *handle = dlopen(BH_CFI_LIB_DL, RTLD_NOW);
-  if (NULL != handle) {
-    bh_cfi_slowpath = dlsym(handle, BH_CFI_SLOWPATH);
-    bh_cfi_slowpath_diag = dlsym(handle, BH_CFI_SLOWPATH_DIAG);
-    dlclose(handle);
-  }
+  // XOP fix (2026-10-10): dlopen("libdl.so") here deadlocks/livelocks the
+  // linker on MIUI 12.5 / Android 11 (Redmi Note 8 Pro) because this ctor runs
+  // from init_array while the OUTER dlopen (System.loadLibrary of the shell
+  // itself) still holds the linker in do_dlopen. dlsym(RTLD_DEFAULT) is a pure
+  // symbol lookup — __cfi_slowpath/__cfi_slowpath_diag are exported by libc,
+  // which is in the global group — and never re-enters do_dlopen.
+  bh_cfi_slowpath = dlsym(RTLD_DEFAULT, BH_CFI_SLOWPATH);
+  bh_cfi_slowpath_diag = dlsym(RTLD_DEFAULT, BH_CFI_SLOWPATH_DIAG);
 }
 
 int bh_cfi_disable_slowpath(void) {

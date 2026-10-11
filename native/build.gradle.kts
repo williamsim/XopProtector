@@ -5,7 +5,12 @@ plugins {
 
 android {
     namespace = "com.yqsh.protector"
-    compileSdk = 34
+    compileSdk = 35
+
+    // NDK r28+ ships a 16K page-size aligned libc++_shared.so prebuilt.
+    // Older NDKs package a 4K-aligned libc++_shared.so which crashes on
+    // 16K-page devices (and fails the Play Nov-2025 16KB requirement).
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         minSdk = 23
@@ -34,6 +39,9 @@ android {
                     args += "-DPROTECTOR_LLVM_OBF_FLAGS=${obfFlags.replace(',', ';')}"
                 }
                 arguments(*args.toTypedArray())
+                // shadowhook 官方 1.1.1 prefab 无 x86/x86_64 模块（开源库本身不支持 x86）。
+                // bytehook 在 x86/x86_64 下不链 shadowhook，仅用本地 AAR 的空桩骗过 prefab 解包，
+                // 真实 x86/x86_64 库见 D:/local-shadowhook/shadowhook-1.1.1.aar。
                 abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
             }
         }
@@ -82,47 +90,9 @@ android {
 
 dependencies {
     implementation("androidx.annotation:annotation:1.7.1")
-    // Required by bytehook on arm/arm64 (dl init/fini monitor). x86/x86_64 skip it.
+    // bytehook 在 arm/arm64 链 shadowhook；x86/x86_64 不链。
+    // shadowhook 官方 1.1.1 prefab 无 x86/x86_64 模块（开源库本身不支持 x86），
+    // 已从 Maven Central 替换为本地 maven 仓库 D:/local-maven 中的修改版
+    // （arm/arm64 为官方真实库，x86/x86_64 为仅供 prefab 解包的空桩）。
     implementation("com.bytedance.android:shadowhook:1.1.1")
-}
-
-// Prefab shadowhook 1.1.1 has no x86/x86_64 modules; AGP still resolves it for every ABI.
-fun plantShadowhookPrefabBypass() {
-    val abis = listOf("x86", "x86_64")
-    fun plantInLibs(libsDir: File) {
-        for (abi in abis) {
-            val so = File(libsDir, "android.$abi/libshadowhook.so")
-            if (so.isFile) continue
-            so.parentFile.mkdirs()
-            File(so.parentFile, "abi.json").writeText(
-                """
-                {
-                  "abi": "$abi",
-                  "api": 16,
-                  "ndk": 23,
-                  "stl": "none",
-                  "static": false
-                }
-                """.trimIndent()
-            )
-            so.createNewFile()
-        }
-    }
-    val gradleHome = file("${System.getProperty("user.home")}/.gradle/caches")
-    val searchRoots = mutableListOf<File>()
-    gradleHome.listFiles()?.filter { it.isDirectory && it.name.startsWith("transforms") }
-        ?.let { searchRoots.addAll(it) }
-    searchRoots += layout.buildDirectory.get().asFile
-    searchRoots.filter { it.isDirectory }.forEach { root ->
-        root.walkTopDown()
-            .filter { it.isDirectory && it.name == "libs" && it.path.contains("shadowhook") }
-            .forEach { plantInLibs(it) }
-    }
-}
-
-tasks.matching {
-    val n = it.name
-    n.startsWith("configureCMake") && (n.endsWith("[x86]") || n.contains("[x86_64]"))
-}.configureEach {
-    doFirst { plantShadowhookPrefabBypass() }
 }

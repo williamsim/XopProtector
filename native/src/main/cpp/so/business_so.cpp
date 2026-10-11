@@ -133,8 +133,8 @@ static std::string keyed_warm_path(const std::string& out_dir, const std::string
 static bool keyed_mapped_plain(const std::string& base);
 static void mark_keyed_mapped_plain(const std::string& base);
 
-/** Real /proc/self/maps via syscall (bypasses maps spoof hooks). */
-static FILE* fopen_maps_raw();
+/** Real /proc/self/maps via syscall (bypasses maps spoof hooks). stdio-free. */
+static protector::MapsRawFile* fopen_maps_raw();
 
 /** Full keyed materialize into so_plain (eager path). Used by eager mode and as
  *  lazy fallback when dlopen hooks are unavailable (e.g. bytehook INITERR_SIG). */
@@ -1088,7 +1088,7 @@ static bool text_pages_executable(uintptr_t start, size_t size) {
         uintptr_t hi;
     };
     std::vector<Span> execs;
-    FILE* fp = fopen_maps_raw();
+    protector::MapsRawFile* fp = fopen_maps_raw();
     if (fp == nullptr) return false;
     std::string line;
     while (protector::read_maps_record(fp, &line)) {
@@ -1099,7 +1099,7 @@ static bool text_pages_executable(uintptr_t start, size_t size) {
         if (!parse_map_span(line.c_str(), &s, &e, &off, &ex) || !ex) continue;
         execs.push_back(Span{s, e});
     }
-    fclose(fp);
+    maps_raw_close(fp);
     if (execs.empty()) return false;
     for (uintptr_t p = first;;) {
         bool hit = false;
@@ -1134,7 +1134,7 @@ static bool locate_mapped_text(const std::string& path, MappedText* out) {
     if (ps <= 0) return false;
     const uint64_t want = p_off & ~static_cast<uint64_t>(ps - 1);
 
-    FILE* fp = fopen_maps_raw();
+    protector::MapsRawFile* fp = fopen_maps_raw();
     if (fp == nullptr) return false;
     uintptr_t map_start = 0;
     bool found = false;
@@ -1151,7 +1151,7 @@ static bool locate_mapped_text(const std::string& path, MappedText* out) {
         found = true;
         break;
     }
-    fclose(fp);
+    maps_raw_close(fp);
     if (!found) return false;
     if (p_vaddr != 0 && map_start < static_cast<uintptr_t>(p_vaddr)) return false;
 
@@ -1221,7 +1221,7 @@ static std::vector<PageSnap> snapshot_text_pages(uintptr_t start, size_t size) {
     if (start > static_cast<uintptr_t>(-1) - (size - 1)) return out;
     const uintptr_t first = start & ~(page - 1);
     const uintptr_t last = (start + size - 1) & ~(page - 1);
-    FILE* fp = fopen_maps_raw();
+    protector::MapsRawFile* fp = fopen_maps_raw();
     if (fp == nullptr) return out;
     std::string line;
     while (protector::read_maps_record(fp, &line)) {
@@ -1240,7 +1240,7 @@ static std::vector<PageSnap> snapshot_text_pages(uintptr_t start, size_t size) {
             p += page;
         }
     }
-    fclose(fp);
+    maps_raw_close(fp);
     return out;
 }
 
@@ -1311,7 +1311,7 @@ static bool vm_read_local(void* dst, uintptr_t src, size_t n) {
                                 &local, 1L, &remote, 1L, 0L);
     if (got == static_cast<ssize_t>(n)) return true;
 #endif
-    FILE* fp = fopen_maps_raw();
+    protector::MapsRawFile* fp = fopen_maps_raw();
     if (fp == nullptr) return false;
     bool readable = false;
     std::string line;
@@ -1330,7 +1330,7 @@ static bool vm_read_local(void* dst, uintptr_t src, size_t n) {
             break;
         }
     }
-    fclose(fp);
+    maps_raw_close(fp);
     if (!readable) return false;
     memcpy(dst, reinterpret_cast<const void*>(src), n);
     return true;
@@ -1405,7 +1405,7 @@ PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name) {
     std::string path;
     bool mapped_plain = false;
     {
-        FILE* fp = fopen_maps_raw();
+        protector::MapsRawFile* fp = fopen_maps_raw();
         if (fp != nullptr) {
             std::string line;
             std::string plain_hit;
@@ -1432,7 +1432,7 @@ PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name) {
                     pkg_hit = map_path;
                 }
             }
-            fclose(fp);
+            maps_raw_close(fp);
             if (!pkg_hit.empty()) {
                 path = std::move(pkg_hit);
                 mapped_plain = false;
@@ -1972,25 +1972,46 @@ using Elf_Shdr_L = Elf32_Shdr;
 using Elf_Sym_L = Elf32_Sym;
 #endif
 
+/** XOP 2026-10-11: read exactly n bytes at off via pread64 — no stdio.
+ *  Android 17 traps fdsan (fopen AND fdopen) during the loadLibrary window. */
+static bool pread_full_elf(int fd, void* dst, size_t n, off64_t off) {
+    if (n == 0) return true;
+    char* p = static_cast<char*>(dst);
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = pread64(fd, p + got, n - got, off + static_cast<off64_t>(got));
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            return false;
+        }
+        got += static_cast<size_t>(r);
+    }
+    return true;
+}
+
 static void* resolve_linker_symbol(const char* elf_path, uintptr_t load_bias,
                                    const char* exact, const char* contains) {
     if (elf_path == nullptr || elf_path[0] == '\0') return nullptr;
-    FILE* fp = fopen(elf_path, "rb");
-    if (fp == nullptr) return nullptr;
+    // XOP 2026-10-11: raw pread() only. fopen()/fdopen() call
+    // android_fdsan_exchange_owner_tag which resolves through the linker's
+    // __loader_shared_globals trap stub on Android 17 (SIGILL) during the
+    // System.loadLibrary / JNI_OnLoad window.
+    int fd = open(elf_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return nullptr;
     Elf_Ehdr_L ehdr{};
-    if (fread(&ehdr, 1, sizeof(ehdr), fp) != sizeof(ehdr)
+    if (!pread_full_elf(fd, &ehdr, sizeof(ehdr), 0)
             || memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
-        fclose(fp);
+        close(fd);
         return nullptr;
     }
     if (ehdr.e_shoff == 0 || ehdr.e_shentsize != sizeof(Elf_Shdr_L) || ehdr.e_shnum == 0) {
-        fclose(fp);
+        close(fd);
         return nullptr;
     }
     std::vector<Elf_Shdr_L> shdrs(ehdr.e_shnum);
-    if (fseek(fp, static_cast<long>(ehdr.e_shoff), SEEK_SET) != 0
-            || fread(shdrs.data(), sizeof(Elf_Shdr_L), ehdr.e_shnum, fp) != ehdr.e_shnum) {
-        fclose(fp);
+    if (!pread_full_elf(fd, shdrs.data(), shdrs.size() * sizeof(Elf_Shdr_L),
+                        static_cast<off64_t>(ehdr.e_shoff))) {
+        close(fd);
         return nullptr;
     }
     auto lookup_in = [&](const Elf_Shdr_L& symtab, const Elf_Shdr_L& strtab) -> void* {
@@ -1999,12 +2020,12 @@ static void* resolve_linker_symbol(const char* elf_path, uintptr_t load_bias,
         if (count == 0 || count > 2 * 1024 * 1024) return nullptr;
         std::vector<Elf_Sym_L> syms(count);
         std::vector<char> strs(static_cast<size_t>(strtab.sh_size));
-        if (fseek(fp, static_cast<long>(symtab.sh_offset), SEEK_SET) != 0
-                || fread(syms.data(), sizeof(Elf_Sym_L), count, fp) != count) {
+        if (!pread_full_elf(fd, syms.data(), syms.size() * sizeof(Elf_Sym_L),
+                            static_cast<off64_t>(symtab.sh_offset))) {
             return nullptr;
         }
-        if (fseek(fp, static_cast<long>(strtab.sh_offset), SEEK_SET) != 0
-                || fread(strs.data(), 1, strs.size(), fp) != strs.size()) {
+        if (!pread_full_elf(fd, strs.data(), strs.size(),
+                            static_cast<off64_t>(strtab.sh_offset))) {
             return nullptr;
         }
         for (const auto& s : syms) {
@@ -2028,7 +2049,7 @@ static void* resolve_linker_symbol(const char* elf_path, uintptr_t load_bias,
         found = lookup_in(sh, strtab);
         if (found) break;
     }
-    fclose(fp);
+    close(fd);
     return found;
 }
 
@@ -2040,22 +2061,24 @@ static void* resolve_linker_symbol(const char* elf_path, uintptr_t load_bias,
 static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias,
                                        const char* want) {
     if (elf_path == nullptr || elf_path[0] == '\0' || want == nullptr) return nullptr;
-    FILE* fp = fopen(elf_path, "rb");
-    if (fp == nullptr) return nullptr;
+    // XOP 2026-10-11: raw pread() only — see resolve_linker_symbol. fdopen()
+    // also traps fdsan on Android 17 during the loadLibrary window.
+    int fd = open(elf_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return nullptr;
     Elf_Ehdr_L ehdr{};
-    if (fread(&ehdr, 1, sizeof(ehdr), fp) != sizeof(ehdr)
+    if (!pread_full_elf(fd, &ehdr, sizeof(ehdr), 0)
             || memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
-        fclose(fp);
+        close(fd);
         return nullptr;
     }
     if (ehdr.e_phoff == 0 || ehdr.e_phnum == 0 || ehdr.e_phentsize != sizeof(Elf_Phdr)) {
-        fclose(fp);
+        close(fd);
         return nullptr;
     }
     std::vector<Elf_Phdr> ph(ehdr.e_phnum);
-    if (fseek(fp, static_cast<long>(ehdr.e_phoff), SEEK_SET) != 0
-            || fread(ph.data(), sizeof(Elf_Phdr), ehdr.e_phnum, fp) != ehdr.e_phnum) {
-        fclose(fp);
+    if (!pread_full_elf(fd, ph.data(), ph.size() * sizeof(Elf_Phdr),
+                        static_cast<off64_t>(ehdr.e_phoff))) {
+        close(fd);
         return nullptr;
     }
     const Elf_Phdr* dyn_ph = nullptr;
@@ -2066,7 +2089,7 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
         }
     }
     if (dyn_ph == nullptr || dyn_ph->p_filesz == 0 || dyn_ph->p_filesz > 1 * 1024 * 1024) {
-        fclose(fp);
+        close(fd);
         return nullptr;
     }
 #ifdef __LP64__
@@ -2079,9 +2102,9 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
     using SymT = Elf32_Sym;
 #endif
     std::vector<DynT> dyn(dyn_ph->p_filesz / sizeof(DynT));
-    if (fseek(fp, static_cast<long>(dyn_ph->p_offset), SEEK_SET) != 0
-            || fread(dyn.data(), sizeof(DynT), dyn.size(), fp) != dyn.size()) {
-        fclose(fp);
+    if (!pread_full_elf(fd, dyn.data(), dyn.size() * sizeof(DynT),
+                        static_cast<off64_t>(dyn_ph->p_offset))) {
+        close(fd);
         return nullptr;
     }
     uintptr_t jmprel = 0;
@@ -2122,7 +2145,7 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
     }
     (void)jmprel_is_rela;
     if (symtab == 0 || strtab == 0 || strsz == 0 || strsz > 8 * 1024 * 1024) {
-        fclose(fp);
+        close(fd);
         return nullptr;
     }
     auto vaddr_to_off = [&](uintptr_t va) -> long {
@@ -2136,9 +2159,9 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
     };
     std::vector<char> strs(strsz);
     long str_off = vaddr_to_off(strtab);
-    if (str_off < 0 || fseek(fp, str_off, SEEK_SET) != 0
-            || fread(strs.data(), 1, strsz, fp) != strsz) {
-        fclose(fp);
+    if (str_off < 0 || !pread_full_elf(fd, strs.data(), strsz,
+                                       static_cast<off64_t>(str_off))) {
+        close(fd);
         return nullptr;
     }
     auto scan_rela = [&](uintptr_t table, size_t bytes) -> void* {
@@ -2147,8 +2170,8 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
         if (off < 0) return nullptr;
         size_t n = bytes / sizeof(RelaT);
         std::vector<RelaT> rels(n);
-        if (fseek(fp, off, SEEK_SET) != 0
-                || fread(rels.data(), sizeof(RelaT), n, fp) != n) {
+        if (!pread_full_elf(fd, rels.data(), rels.size() * sizeof(RelaT),
+                            static_cast<off64_t>(off))) {
             return nullptr;
         }
         for (const auto& r : rels) {
@@ -2167,8 +2190,7 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
             long sym_off = vaddr_to_off(symtab + static_cast<uintptr_t>(si) * syment);
             if (sym_off < 0) continue;
             SymT sy{};
-            if (fseek(fp, sym_off, SEEK_SET) != 0
-                    || fread(&sy, 1, sizeof(sy), fp) != sizeof(sy)) {
+            if (!pread_full_elf(fd, &sy, sizeof(sy), static_cast<off64_t>(sym_off))) {
                 continue;
             }
             if (sy.st_name >= strsz) continue;
@@ -2179,7 +2201,7 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
     };
     void* hit = scan_rela(jmprel, pltrelsz);
     if (hit == nullptr) hit = scan_rela(rel, relsz);
-    fclose(fp);
+    close(fd);
     return hit;
 }
 
@@ -2207,7 +2229,7 @@ static bool find_linker_info(LinkerInfo* out) {
     out->path[0] = 0;
     dl_iterate_phdr(linker_phdr_cb, out);
     if (out->path[0] != 0) return true;
-    FILE* fp = fopen_maps_raw();
+    protector::MapsRawFile* fp = fopen_maps_raw();
     if (fp == nullptr) return false;
     std::string line;
     while (protector::read_maps_record(fp, &line)) {
@@ -2228,10 +2250,10 @@ static bool find_linker_info(LinkerInfo* out) {
         if (strcmp(base, "linker") != 0 && strcmp(base, "linker64") != 0) continue;
         out->load_bias = static_cast<uintptr_t>(start);
         strncpy(out->path, map_path.c_str(), sizeof(out->path) - 1);
-        fclose(fp);
+        maps_raw_close(fp);
         return true;
     }
-    fclose(fp);
+    maps_raw_close(fp);
     return false;
 }
 
@@ -2267,7 +2289,7 @@ static std::string maps_basename(std::string path) {
 /** First non-helper maps path for {@code base}, or empty. */
 static std::string first_packaged_map_path(const std::string& base) {
     if (base.empty()) return {};
-    FILE* fp = fopen_maps_raw();
+    protector::MapsRawFile* fp = fopen_maps_raw();
     if (fp == nullptr) return {};
     std::string line;
     std::string hit;
@@ -2279,7 +2301,7 @@ static std::string first_packaged_map_path(const std::string& base) {
         hit = std::move(path);
         break;
     }
-    fclose(fp);
+    maps_raw_close(fp);
     return hit;
 }
 
@@ -2304,7 +2326,7 @@ static void decrypt_extract_inode_mapped() {
     }
     if (pending.empty()) return;
 
-    FILE* fp = fopen_maps_raw();
+    protector::MapsRawFile* fp = fopen_maps_raw();
     if (fp == nullptr) return;
     std::vector<std::string> to_decrypt;
     std::unordered_set<std::string> saw_plain;
@@ -2326,7 +2348,7 @@ static void decrypt_extract_inode_mapped() {
         saw_plain.erase(base);
         if (pending.empty()) break;
     }
-    fclose(fp);
+    maps_raw_close(fp);
 
     for (const auto& name : saw_plain) {
         if (pending.count(name) == 0) continue;
@@ -5472,14 +5494,11 @@ void decrypt_already_loaded_async() {
     }).detach();
 }
 
-/** Real /proc/self/maps — bypasses libc fopen/open hooks (maps spoof). */
-static FILE* fopen_maps_raw() {
-    int fd = static_cast<int>(syscall(__NR_openat, AT_FDCWD, "/proc/self/maps",
-                                      O_RDONLY | O_CLOEXEC));
-    if (fd < 0) return nullptr;
-    FILE* fp = fdopen(fd, "r");
-    if (fp == nullptr) close(fd);
-    return fp;
+/** Real /proc/self/maps — bypasses libc fopen/open hooks (maps spoof).
+ *  XOP 2026-10-11: stdio-free (Android 17 traps fdopen's fdsan during the
+ *  loadLibrary window; this is called from JNI_OnLoad hook installation). */
+static protector::MapsRawFile* fopen_maps_raw() {
+    return maps_raw_open();
 }
 
 static bool is_proc_maps_path(const char* pathname) {
@@ -5545,11 +5564,11 @@ static std::string rewrite_maps_line(const std::string& line_in) {
 
 static int build_spoofed_maps_fd() {
 #if defined(__ANDROID__) && defined(__NR_memfd_create)
-    FILE* in = fopen_maps_raw();
+    protector::MapsRawFile* in = fopen_maps_raw();
     if (in == nullptr) return -1;
     int out = static_cast<int>(syscall(__NR_memfd_create, "xop_maps", MFD_CLOEXEC));
     if (out < 0) {
-        fclose(in);
+        maps_raw_close(in);
         return -1;
     }
     std::string line;
@@ -5560,11 +5579,11 @@ static int build_spoofed_maps_fd() {
         size_t n = line.size();
         if (w < 0 || static_cast<size_t>(w) != n) {
             close(out);
-            fclose(in);
+            maps_raw_close(in);
             return -1;
         }
     }
-    fclose(in);
+    maps_raw_close(in);
     if (lseek(out, 0, SEEK_SET) < 0) {
         close(out);
         return -1;
@@ -5962,8 +5981,18 @@ void install_business_so_hooks() {
     if (s12) PLOGI("business so: __realpath_chk hooked");
     else PLOGW("business so: __realpath_chk hook failed");
 
-    install_linker_extract_hooks();
-    install_linker_open_hooks();
+    // XOP fix (2026-10-10, Mi 10 Lite Zoom / MIUI Android 11 SIGSEGV in linker
+    // dlclose logging): the Dobby INLINE hooks that patch linker code
+    // (call_constructors / mmap64 / __loader_android_dlopen_ext / openat) must
+    // NOT run from the shell constructor. On MIUI 12.5 / Android 11 the binder
+    // threads execute linker code (dlclose from libgui VpsExtension during
+    // window setup) while loadLibrary is still in progress — patching linker
+    // instructions concurrently corrupted the linker (crash inside
+    // LinkerLogger::Log / out_vformat on every launch, 2/2 reproductions).
+    // The bytehook GOT hooks above only rewrite pointer cells and stay in the
+    // constructor (Huawei Android 12 has been verified with them there); the
+    // linker-code Dobby hooks are deferred to JNI_OnLoad via
+    // install_linker_dobby_hooks_deferred().
 
     const bool any = (s1 != nullptr) || (s2 != nullptr) || (s3 != nullptr);
     g_dlopen_hooks_ok.store(any, std::memory_order_release);
@@ -5984,6 +6013,20 @@ void install_business_so_hooks() {
     // Eager scan deferred — see decrypt_already_loaded_async from init_app.
 }
 
+void install_linker_dobby_hooks_deferred() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        // Called from JNI_OnLoad: the outer dlopen has fully completed and the
+        // linker is quiescent on this thread. Binder threads may still run
+        // linker code concurrently, but Dobby patching here happens after
+        // loadLibrary (not during it), which avoids the MIUI Android 11
+        // torn-patch race seen with constructor-time installation.
+        PLOGI("business so: deferred linker Dobby hooks install (JNI_OnLoad)");
+        install_linker_extract_hooks();
+        install_linker_open_hooks();
+    });
+}
+
 /**
  * True when /proc/self/maps has an executable mapping of {@code base} whose
  * path is <b>not</b> so_plain (typically packaged extract ciphertext).
@@ -5992,7 +6035,7 @@ void install_business_so_hooks() {
  */
 static bool packaged_so_mapped(const std::string& base) {
     if (base.empty()) return false;
-    FILE* fp = fopen_maps_raw();
+    protector::MapsRawFile* fp = fopen_maps_raw();
     if (fp == nullptr) return false;
     std::string line;
     bool hit = false;
@@ -6009,7 +6052,7 @@ static bool packaged_so_mapped(const std::string& base) {
             break;
         }
     }
-    fclose(fp);
+    maps_raw_close(fp);
     return hit;
 }
 

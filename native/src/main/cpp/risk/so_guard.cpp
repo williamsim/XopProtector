@@ -11,6 +11,7 @@
 #include <cstring>
 #include <string>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <unistd.h>
@@ -72,19 +73,24 @@ PROTECTOR_ENCRYPT void so_guard_init() {
         PLOGW("so_guard_init: .bitcode not mapped (HMAC deferred)");
     }
 
-    FILE* st = fopen("/proc/self/status", "r");
-    if (st) {
-        char line[256];
-        int tracer = -1;
-        while (fgets(line, sizeof(line), st)) {
-            if (strncmp(line, "TracerPid:", 10) == 0) {
-                sscanf(line + 10, "%d", &tracer);
-                break;
+    // NOTE: do not use fopen here — this runs from the constructor during
+    // System.loadLibrary, where fopen's PLT can mis-resolve on Android 17+
+    // (linker __loader_shared_globals trap -> SIGILL). Raw open/read instead.
+    int fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        char buf[1024];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = '\0';
+            const char* p = strstr(buf, "TracerPid:");
+            if (p != nullptr) {
+                int tracer = -1;
+                sscanf(p + 10, "%d", &tracer);
+                if (tracer == 0) {
+                    prctl(PR_SET_DUMPABLE, 0);
+                }
             }
-        }
-        fclose(st);
-        if (tracer == 0) {
-            prctl(PR_SET_DUMPABLE, 0);
         }
     }
 

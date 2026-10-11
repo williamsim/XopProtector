@@ -8,6 +8,7 @@ import com.wind.meditor.property.ModificationProperty;
 import com.wind.meditor.utils.NodeValue;
 
 import com.yqsh.protector.packer.util.CryptoUtils;
+import com.yqsh.protector.packer.elf.ElfAlignment;
 
 import net.lingala.zip4j.ZipFile;
 import net.lingala.zip4j.model.ZipParameters;
@@ -964,6 +965,10 @@ public class PackerMain {
                 for (File so : sos) {
                     File dest = new File(dstAbi, so.getName());
                     Files.copy(so.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    // Shell SOs are ours — a 4K-aligned 64-bit libc++_shared.so (NDK < r28)
+                    // crashes on 16K-page devices. Fail fast, don't ship a broken APK.
+                    // (32-bit ABIs can't run on 16K devices; their check is skipped.)
+                    ElfAlignment.require16kAlignedIf64Bit(dest, "Shell lib " + abi + "/" + so.getName());
                     if ("libprotector.so".equals(so.getName()) && kWrap != null) {
                         String hmacHex = SoSectionEncryptor.encrypt(dest, kWrap, kMaster, kHmac);
                         bitcodeHmac.put(abi, hmacHex);
@@ -2093,8 +2098,9 @@ public class PackerMain {
 
     /**
      * Media / resource types that need an uncompressed FD (SoundPool, openRawResourceFd).
-     * Do NOT list .so/.dex/.zip here — inherit input STORED via storeEntries, else DEFLATE
-     * (extractNativeLibs=true allows compressed native libs).
+     * Do NOT list .dex/.zip here — inherit input STORED via storeEntries, else DEFLATE.
+     * NOTE: .so under lib/ is handled explicitly in {@link #shouldStoreUncompressed}
+     * and is ALWAYS stored uncompressed (see below).
      */
     private static final String[] NO_COMPRESS_EXT = {
             ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif",
@@ -2113,11 +2119,19 @@ public class PackerMain {
         if (entryName.equals("resources.arsc")) {
             return true;
         }
+        String lower = entryName.toLowerCase(Locale.ROOT);
+        // Native libraries are ALWAYS stored uncompressed (matches AGP default).
+        // With extractNativeLibs=false the system mmaps .so directly from the APK,
+        // which requires STORED + page-aligned entries; DEFLATEd shell libs
+        // (libprotector.so / libc++_shared.so embedded by embedShell) would
+        // otherwise break install/load on such apps.
+        if (lower.startsWith("lib/") && lower.endsWith(".so")) {
+            return true;
+        }
         // Preserve compression method from the input APK (uncompressed .so stay STORE).
         if (storeEntries != null && storeEntries.contains(entryName)) {
             return true;
         }
-        String lower = entryName.toLowerCase(Locale.ROOT);
         for (String ext : NO_COMPRESS_EXT) {
             if (lower.endsWith(ext)) {
                 return true;

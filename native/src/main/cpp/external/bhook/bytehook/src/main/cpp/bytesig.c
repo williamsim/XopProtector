@@ -70,25 +70,24 @@ static void *bytesig_sigaction;    // point to libc's sigaction64() or libc's si
 static void *bytesig_sigprocmask;  // point to libc's sigprocmask() or libc's sigprocmask64()
 
 __attribute__((constructor)) static void bytesig_ctor(void) {
-  void *libc = dlopen("libc.so", RTLD_LOCAL);
-  if (__predict_false(NULL == libc)) return;
-
+  // XOP fix (2026-10-10): dlopen("libc.so") here re-enters do_dlopen from
+  // init_array while the OUTER dlopen of the shell itself is still in
+  // progress — livelocks the linker on some MIUI/Android 11 builds. libc is
+  // always in the global group, so dlsym(RTLD_DEFAULT) resolves the same
+  // symbols without ever touching the loader path.
   if (__predict_true(NULL != sigfillset64 && NULL != sigemptyset64 && NULL != sigaddset64 &&
                      NULL != sigismember64)) {
-    if (__predict_true(NULL != (bytesig_sigaction = dlsym(libc, "sigaction64")) &&
-                       NULL != (bytesig_sigprocmask = dlsym(libc, "sigprocmask64")))) {
+    if (__predict_true(NULL != (bytesig_sigaction = dlsym(RTLD_DEFAULT, "sigaction64")) &&
+                       NULL != (bytesig_sigprocmask = dlsym(RTLD_DEFAULT, "sigprocmask64")))) {
       bytesig_status = BYTESIG_STATUS_SIG64;
-      goto end;
+      return;
     }
   }
 
-  if (__predict_true(NULL != (bytesig_sigaction = dlsym(libc, "sigaction")) &&
-                     NULL != (bytesig_sigprocmask = dlsym(libc, "sigprocmask")))) {
+  if (__predict_true(NULL != (bytesig_sigaction = dlsym(RTLD_DEFAULT, "sigaction")) &&
+                     NULL != (bytesig_sigprocmask = dlsym(RTLD_DEFAULT, "sigprocmask")))) {
     bytesig_status = BYTESIG_STATUS_SIG32;
   }
-
-end:
-  dlclose(libc);
 }
 
 #define BYTESIG_PROTECTED_THREADS_MAX 256

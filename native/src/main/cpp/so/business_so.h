@@ -51,6 +51,16 @@ void preload_so_plain();
 /** Install dlopen / android_dlopen_ext hooks to decrypt .text on first load. */
 void install_business_so_hooks();
 
+/**
+ * Install the Dobby hooks that patch LINKER CODE (call_constructors / mmap64 /
+ * __loader_android_dlopen_ext / openat) for the extract-inode in-memory
+ * decrypt path. MUST be deferred to JNI_OnLoad — patching linker instructions
+ * from the shell constructor races with concurrent linker execution on binder
+ * threads (MIUI Android 11: SIGSEGV inside linker dlclose logging, 2/2).
+ * Idempotent.
+ */
+void install_linker_dobby_hooks_deferred();
+
 /** True if any business SO keys were loaded. */
 bool has_sokeys();
 

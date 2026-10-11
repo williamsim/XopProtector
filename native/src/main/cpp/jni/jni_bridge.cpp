@@ -7,6 +7,7 @@
 #include "so/business_so.h"
 #include "vm/pvm2_interp.h"
 #include "crypto/assets_crypt.h"
+#include "crypto/section_decrypt.h"
 #include "report/threat_report.h"
 #include "common/runtime_state.h"
 
@@ -178,5 +179,16 @@ PROTECTOR_ENCRYPT JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
         return JNI_ERR;
     }
     protector::runtime::on_load(vm);
+    // Deferred from constructor: install bytehook / dlopen hooks / risk thread
+    // now that dlopen has completed and linker state is stable (Android 17+
+    // constructor-time hook init can SIGILL via mis-resolved fopen PLT).
+    // B1 bisect variant: bytehook hooks installed in constructor (init_protector);
+    // do NOT install again here.
+    // protector::init_protector_late();
+    // XOP fix (2026-10-10): the Dobby hooks that patch LINKER CODE must not run
+    // from the constructor — on MIUI Android 11 they race with concurrent
+    // linker execution on binder threads (SIGSEGV in dlclose logging). Install
+    // them here, after the outer dlopen has fully completed.
+    protector::so::install_linker_dobby_hooks_deferred();
     return JNI_VERSION_1_6;
 }

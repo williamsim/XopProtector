@@ -851,6 +851,11 @@ static void detect_emulator() {
 // ── Background thread ──────────────────────────────────────────────
 
 static void* risk_thread_main(void*) {
+    // Android 15+/17 safety: this thread is spawned from the constructor
+    // (init_array). fopen()/fdsan during the linker init window can hit the
+    // linker's __builtin_trap stub (SIGILL). Sleep past the window before the
+    // first round of /proc-based detection.
+    sleep(3);
     // Run Xposed / root / emulator checks only once on first iteration —
     // these can't appear mid-process.
     bool ran_one_shot = false;

@@ -1,6 +1,8 @@
 plugins {
-    id("com.android.application") version "8.2.2" apply false
-    id("com.android.library") version "8.2.2" apply false
+    // AGP 8.5.1+: aligns uncompressed native libs to the 16K zip boundary
+    // (part of the Play Nov-2025 16KB page-size requirement).
+    id("com.android.application") version "8.5.2" apply false
+    id("com.android.library") version "8.5.2" apply false
     id("org.jetbrains.kotlin.android") version "1.9.22" apply false
 }
 

@@ -5,12 +5,16 @@ plugins {
 
 android {
     namespace = "com.yqsh.protectordemo"
-    compileSdk = 34
+    compileSdk = 35
+
+    // Keep in sync with :native — NDK r28+ ships 16K-aligned libc++_shared.so
+    // and defaults new native libs to 16K page alignment.
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "com.yqsh.protectordemo"
         minSdk = 23
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

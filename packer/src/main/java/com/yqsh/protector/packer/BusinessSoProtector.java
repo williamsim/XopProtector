@@ -1,6 +1,7 @@
 package com.yqsh.protector.packer;
 
 import com.yqsh.protector.packer.elf.ReadElf;
+import com.yqsh.protector.packer.elf.ElfAlignment;
 import com.yqsh.protector.packer.util.CryptoUtils;
 
 import java.io.ByteArrayOutputStream;
@@ -786,6 +787,15 @@ public final class BusinessSoProtector {
             for (Candidate c : g.files) {
                 // Markers live in .dynstr/.rodata — capture before in-place .text RC4.
                 boolean l2e = isPathSensitive(c.so);
+                if (ElfAlignment.is64BitElf(c.so) && !ElfAlignment.is16kAligned(c.so)) {
+                    // Third-party SDK SO — warn only; packer cannot rebuild it.
+                    // (32-bit ABIs can't run on 16K-page devices; skip them.)
+                    long minAlign = ElfAlignment.minLoadAlignment(c.so);
+                    System.out.println("WARN: business SO not 16K page-size aligned: " + c.path()
+                            + " (min PT_LOAD p_align="
+                            + (minAlign < 0 ? "n/a" : "0x" + Long.toHexString(minAlign))
+                            + ") — may fail to load on 16K-page devices; ask the SDK vendor for an NDK r28+ build");
+                }
                 TextDiag diag = encryptText(c.so, key);
                 SoDecision d = new SoDecision(c.abi, c.name, c.fileBytes, c.textBytes,
                         c.estimatedDeltaBytes, "encrypted", diag, l2e);

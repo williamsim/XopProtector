@@ -188,6 +188,8 @@ public class ReadElf implements AutoCloseable {
     /** Dynamic Symbol Table symbol names */
     private Map<String, Symbol> mDynamicSymbols;
     private List<SectionHeader> mSectionHeaderList;
+    /** p_align of every PT_LOAD program header, in file order. */
+    private final List<Long> mLoadAligns = new ArrayList<>();
 
     public static ReadElf read(File file) throws IOException {
         return new ReadElf(file);
@@ -343,15 +345,38 @@ public class ReadElf implements AutoCloseable {
                 if (mAddrSize == 8) {
                     // Only in Elf64_phdr; in Elf32_phdr p_flags is at the end.
                     long p_flags = readWord();
-                }
-                long p_offset = readOff();
-                long p_vaddr = readAddr();
-                // ...
-                if (p_vaddr == 0) {
-                    mIsPIE = true;
+                    long p_offset = readOff();
+                    long p_vaddr = readAddr();
+                    readAddr();          // p_paddr (unused)
+                    readX(mAddrSize);    // p_filesz (unused)
+                    readX(mAddrSize);    // p_memsz (unused)
+                    mLoadAligns.add(readX(mAddrSize)); // p_align
+                    if (p_vaddr == 0) {
+                        mIsPIE = true;
+                    }
+                } else {
+                    long p_offset = readOff();
+                    long p_vaddr = readAddr();
+                    readAddr();   // p_paddr (unused)
+                    readWord();   // p_filesz (unused)
+                    readWord();   // p_memsz (unused)
+                    readWord();   // p_flags (unused, at the end in Elf32_phdr)
+                    mLoadAligns.add(readWord()); // p_align
+                    if (p_vaddr == 0) {
+                        mIsPIE = true;
+                    }
                 }
             }
         }
+    }
+
+    /**
+     * p_align values of all PT_LOAD segments, in file order.
+     * A shared library is 16K page-size compatible when every PT_LOAD
+     * has p_align &gt;= 0x4000 (see {@code ElfAlignment}).
+     */
+    public List<Long> getLoadSegmentAlignments() {
+        return java.util.Collections.unmodifiableList(mLoadAligns);
     }
 
     private HashMap<String, Symbol> readSymbolTable(long symStrOffset, long symStrSize,

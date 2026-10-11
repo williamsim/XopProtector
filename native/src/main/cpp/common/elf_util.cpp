@@ -1,11 +1,13 @@
 #include "common/elf_util.h"
 #include "common/log.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <limits.h>
+#include <new>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
@@ -13,13 +15,60 @@
 namespace protector {
 
 /** Bypass libc fopen hooks (business_so may spoof /proc/self/maps for OSG). */
-static FILE* fopen_maps_raw() {
+// XOP 2026-10-11: fopen_maps_raw removed — fdopen() traps fdsan on Android 17
+// during the loadLibrary window. Use maps_raw_open()/read_maps_record(MapsRawFile*).
+
+// ---- raw (stdio-free) maps reader -----------------------------------------
+// Android 17 traps fdsan during the System.loadLibrary window: fopen() AND
+// fdopen() both call android_fdsan_exchange_owner_tag, which resolves through
+// the linker's __loader_shared_globals trap stub (SIGILL). Early-startup code
+// must read /proc files with raw read() only.
+
+MapsRawFile* maps_raw_open() {
     int fd = static_cast<int>(syscall(__NR_openat, AT_FDCWD, "/proc/self/maps",
                                       O_RDONLY | O_CLOEXEC));
     if (fd < 0) return nullptr;
-    FILE* fp = fdopen(fd, "r");
-    if (fp == nullptr) close(fd);
-    return fp;
+    MapsRawFile* mf = new (std::nothrow) MapsRawFile();
+    if (mf == nullptr) { close(fd); return nullptr; }
+    mf->fd = fd;
+    return mf;
+}
+
+void maps_raw_close(MapsRawFile* mf) {
+    if (mf == nullptr) return;
+    if (mf->fd >= 0) close(mf->fd);
+    delete mf;
+}
+
+bool read_maps_record(MapsRawFile* mf, std::string* line) {
+    if (mf == nullptr || mf->fd < 0 || line == nullptr) return false;
+    line->clear();
+    for (;;) {
+        size_t nl = mf->buf.find('\n');
+        if (nl != std::string::npos) {
+            line->append(mf->buf, 0, nl + 1);
+            mf->buf.erase(0, nl + 1);
+            return true;
+        }
+        if (mf->eof) {
+            if (mf->buf.empty()) return false;
+            line->append(mf->buf);
+            mf->buf.clear();
+            return true;
+        }
+        char chunk[8192];
+        ssize_t r = read(mf->fd, chunk, sizeof(chunk));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            mf->eof = true;
+            continue;
+        }
+        if (r == 0) {
+            mf->eof = true;
+            continue;
+        }
+        mf->buf.append(chunk, static_cast<size_t>(r));
+    }
 }
 
 bool read_maps_record(FILE* fp, std::string* line) {
@@ -68,7 +117,7 @@ bool maps_pathname(const std::string& line, std::string* path) {
 
 std::string find_so_path(const char* so_name) {
     if (so_name == nullptr || so_name[0] == 0) return {};
-    FILE* fp = fopen_maps_raw();
+    MapsRawFile* fp = maps_raw_open();
     if (!fp) return {};
 
     // Prefer protector so_plain mirror (plaintext) over /data/app packaged ciphertext.
@@ -89,7 +138,7 @@ std::string find_so_path(const char* so_name) {
         }
         if (any_hit.empty()) any_hit = std::move(path);
     }
-    fclose(fp);
+    maps_raw_close(fp);
     return !plain_hit.empty() ? plain_hit : any_hit;
 }
 
@@ -192,7 +241,7 @@ bool find_so_load_bias(const char* so_name, uintptr_t* out_bias) {
     std::string path = find_so_path(so_name);
     if (path.empty()) return false;
 
-    FILE* fp = fopen_maps_raw();
+    MapsRawFile* fp = maps_raw_open();
     if (!fp) return false;
     uintptr_t map_start = 0;
     bool found_map = false;
@@ -209,7 +258,7 @@ bool find_so_load_bias(const char* so_name, uintptr_t* out_bias) {
             break;
         }
     }
-    fclose(fp);
+    maps_raw_close(fp);
     if (!found_map) return false;
 
     uint64_t p_vaddr = 0;
