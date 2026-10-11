@@ -57,10 +57,15 @@ void install_business_so_hooks();
  * decrypt path. MUST be deferred to JNI_OnLoad — patching linker instructions
  * from the shell constructor races with concurrent linker execution on binder
  * threads (MIUI Android 11: SIGSEGV inside linker dlclose logging, 2/2).
- * On API <= 30 the deferral is still not enough (JPush worker threads race the
- * patch window: soinfo-pool corruption, generate_handle CHECK abort on Redmi
- * Note 9 Pro V12.5.7) — there no linker code is patched at all and all keyed
- * SOs take the so_plain/lib_mirror plaintext path.
+ * Inline linker patching is only allowed on the VERIFIED MIDDLE WINDOW
+ * (API 31..35, Huawei A12 verified):
+ *  - API <= 30: JPush worker threads race the patch window (soinfo-pool
+ *    corruption, generate_handle CHECK abort on Redmi Note 9 Pro V12.5.7).
+ *  - API >= 36: brand-new linker with unverified Dobby patterns, and libc
+ *    fdsan (even plain close()) traps via __loader_shared_globals during the
+ *    loadLibrary window (Xiaomi 17 HyperOS 2x SIGILL).
+ * Outside the window no linker code is patched and all keyed SOs take the
+ * so_plain/lib_mirror plaintext path.
  * Idempotent.
  */
 void install_linker_dobby_hooks_deferred();

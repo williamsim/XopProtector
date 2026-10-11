@@ -1989,6 +1989,29 @@ static bool pread_full_elf(int fd, void* dst, size_t n, off64_t off) {
     return true;
 }
 
+/** XOP 2026-10-11 (round 2): libc close() also goes through fdsan
+ *  (close -> android_fdsan_close_with_tag -> __loader_shared_globals, the
+ *  linker-exported accessor for libc_shared_globals which HOLDS the FdTable)
+ *  and traps with SIGILL on Android 17 inside the loadLibrary/JNI_OnLoad
+ *  window. open() is converted too for symmetry. Raw syscalls touch no GOT,
+ *  no fdsan and no linker state. */
+static int xop_raw_open(const char* path) {
+#if defined(__NR_openat)
+    return static_cast<int>(
+            syscall(__NR_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0));
+#else
+    return open(path, O_RDONLY | O_CLOEXEC);
+#endif
+}
+
+static void xop_raw_close(int fd) {
+#if defined(__NR_close)
+    if (fd >= 0) syscall(__NR_close, fd);
+#else
+    if (fd >= 0) close(fd);
+#endif
+}
+
 static void* resolve_linker_symbol(const char* elf_path, uintptr_t load_bias,
                                    const char* exact, const char* contains) {
     if (elf_path == nullptr || elf_path[0] == '\0') return nullptr;
@@ -1996,22 +2019,22 @@ static void* resolve_linker_symbol(const char* elf_path, uintptr_t load_bias,
     // android_fdsan_exchange_owner_tag which resolves through the linker's
     // __loader_shared_globals trap stub on Android 17 (SIGILL) during the
     // System.loadLibrary / JNI_OnLoad window.
-    int fd = open(elf_path, O_RDONLY | O_CLOEXEC);
+    int fd = xop_raw_open(elf_path);
     if (fd < 0) return nullptr;
     Elf_Ehdr_L ehdr{};
     if (!pread_full_elf(fd, &ehdr, sizeof(ehdr), 0)
             || memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
-        close(fd);
+        xop_raw_close(fd);
         return nullptr;
     }
     if (ehdr.e_shoff == 0 || ehdr.e_shentsize != sizeof(Elf_Shdr_L) || ehdr.e_shnum == 0) {
-        close(fd);
+        xop_raw_close(fd);
         return nullptr;
     }
     std::vector<Elf_Shdr_L> shdrs(ehdr.e_shnum);
     if (!pread_full_elf(fd, shdrs.data(), shdrs.size() * sizeof(Elf_Shdr_L),
                         static_cast<off64_t>(ehdr.e_shoff))) {
-        close(fd);
+        xop_raw_close(fd);
         return nullptr;
     }
     auto lookup_in = [&](const Elf_Shdr_L& symtab, const Elf_Shdr_L& strtab) -> void* {
@@ -2049,7 +2072,7 @@ static void* resolve_linker_symbol(const char* elf_path, uintptr_t load_bias,
         found = lookup_in(sh, strtab);
         if (found) break;
     }
-    close(fd);
+    xop_raw_close(fd);
     return found;
 }
 
@@ -2063,22 +2086,22 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
     if (elf_path == nullptr || elf_path[0] == '\0' || want == nullptr) return nullptr;
     // XOP 2026-10-11: raw pread() only — see resolve_linker_symbol. fdopen()
     // also traps fdsan on Android 17 during the loadLibrary window.
-    int fd = open(elf_path, O_RDONLY | O_CLOEXEC);
+    int fd = xop_raw_open(elf_path);
     if (fd < 0) return nullptr;
     Elf_Ehdr_L ehdr{};
     if (!pread_full_elf(fd, &ehdr, sizeof(ehdr), 0)
             || memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
-        close(fd);
+        xop_raw_close(fd);
         return nullptr;
     }
     if (ehdr.e_phoff == 0 || ehdr.e_phnum == 0 || ehdr.e_phentsize != sizeof(Elf_Phdr)) {
-        close(fd);
+        xop_raw_close(fd);
         return nullptr;
     }
     std::vector<Elf_Phdr> ph(ehdr.e_phnum);
     if (!pread_full_elf(fd, ph.data(), ph.size() * sizeof(Elf_Phdr),
                         static_cast<off64_t>(ehdr.e_phoff))) {
-        close(fd);
+        xop_raw_close(fd);
         return nullptr;
     }
     const Elf_Phdr* dyn_ph = nullptr;
@@ -2089,7 +2112,7 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
         }
     }
     if (dyn_ph == nullptr || dyn_ph->p_filesz == 0 || dyn_ph->p_filesz > 1 * 1024 * 1024) {
-        close(fd);
+        xop_raw_close(fd);
         return nullptr;
     }
 #ifdef __LP64__
@@ -2104,7 +2127,7 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
     std::vector<DynT> dyn(dyn_ph->p_filesz / sizeof(DynT));
     if (!pread_full_elf(fd, dyn.data(), dyn.size() * sizeof(DynT),
                         static_cast<off64_t>(dyn_ph->p_offset))) {
-        close(fd);
+        xop_raw_close(fd);
         return nullptr;
     }
     uintptr_t jmprel = 0;
@@ -2145,7 +2168,7 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
     }
     (void)jmprel_is_rela;
     if (symtab == 0 || strtab == 0 || strsz == 0 || strsz > 8 * 1024 * 1024) {
-        close(fd);
+        xop_raw_close(fd);
         return nullptr;
     }
     auto vaddr_to_off = [&](uintptr_t va) -> long {
@@ -2161,7 +2184,7 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
     long str_off = vaddr_to_off(strtab);
     if (str_off < 0 || !pread_full_elf(fd, strs.data(), strsz,
                                        static_cast<off64_t>(str_off))) {
-        close(fd);
+        xop_raw_close(fd);
         return nullptr;
     }
     auto scan_rela = [&](uintptr_t table, size_t bytes) -> void* {
@@ -2201,7 +2224,7 @@ static void* resolve_linker_import_got(const char* elf_path, uintptr_t load_bias
     };
     void* hit = scan_rela(jmprel, pltrelsz);
     if (hit == nullptr) hit = scan_rela(rel, relsz);
-    close(fd);
+    xop_raw_close(fd);
     return hit;
 }
 
@@ -6051,13 +6074,26 @@ void install_linker_dobby_hooks_deferred() {
     static std::once_flag once;
     std::call_once(once, []() {
         // Called from JNI_OnLoad: the outer dlopen has fully completed and the
-        // linker is quiescent on this thread. On API >= 31 this deferral is
-        // enough (Huawei Android 12 verified). On API <= 30 (MIUI 12.5) it is
-        // NOT: app worker threads (JPush jg_c_net_1) start dlopening within
-        // ~150 ms of shell init and race the patch writes — see
-        // linker_inline_patch_forbidden(). There install_linker_extract_hooks
-        // is a no-op and install_linker_open_hooks falls back to GOT pointer
-        // patches only, so no linker instruction bytes are ever modified.
+        // linker is quiescent on this thread. Inline linker patching is only
+        // allowed on the verified middle window (API 31..35, Huawei A12
+        // verified). Outside it we never touch linker instruction bytes:
+        //  - API <= 30 (MIUI 12.5): app worker threads (JPush jg_c_net_1)
+        //    start dlopening within ~150 ms of shell init and race the patch
+        //    writes — linker_inline_patch_forbidden() below; extract hooks
+        //    are a no-op and open hooks fall back to GOT pointer patches.
+        //  - API >= 36 (Xiaomi HyperOS / Android 16+): brand-new linker,
+        //    Dobby byte patterns unverified, AND libc fdsan (including plain
+        //    close()) traps through __loader_shared_globals during the
+        //    loadLibrary window (Redmi Note 9 Pro 2x SIGABRT soinfo pool
+        //    corruption; Xiaomi 17 2x SIGILL). Keyed SOs take the
+        //    so_plain/lib_mirror plaintext path, same as API <= 30.
+        const int api = android_get_device_api_level();
+        if (api <= 30 || api >= 36) {
+            PLOGI("business so: linker Dobby hooks disabled on API %d "
+                  "(no inline linker patch policy)",
+                  api);
+            return;
+        }
         PLOGI("business so: deferred linker Dobby hooks install (JNI_OnLoad)");
         install_linker_extract_hooks();
         install_linker_open_hooks();

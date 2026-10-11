@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.7.4 (hotfix 2026-10-11: zero fdsan in window + no linker patch on Android 16+)
+
+Xiaomi 17 (HyperOS 4.0.0.9 / Android 17) cloud test 2/2 SIGILL ~启动后立刻,
+`pc = linker64+0x8de60 (__loader_shared_globals)` — the trap stub, hit through
+`close() -> android_fdsan_close_with_tag` called from
+`resolve_linker_symbol` inside the JNI_OnLoad deferred-hook path. The 0.7.2
+fix removed fopen/fdopen (exchange_owner_tag) but libc `close()` also enters
+fdsan: `libc_shared_globals` (accessed via the linker-exported
+`__loader_shared_globals()`) HOLDS the FdTable, so every fdsan check
+re-resolves that import — and on this device it is a trap during the
+loadLibrary/JNI_OnLoad window. fdopen (0.7.2 round) and close (this round)
+are the same disease.
+
+Fix (window = shell constructor + JNI_OnLoad):
+- business_so.cpp: `xop_raw_open`/`xop_raw_close` (syscall `__NR_openat` /
+  `__NR_close`); `resolve_linker_symbol` + `resolve_linker_import_got` fully
+  converted — zero fdsan-touching libc calls remain in the window.
+- elf_util.cpp: `maps_raw_close` uses `syscall(__NR_close)`.
+- `install_linker_dobby_hooks_deferred`: inline linker patching now restricted
+  to the VERIFIED MIDDLE WINDOW API 31..35 (Huawei A12 verified). API <= 30
+  was already forbidden (0.7.3, MIUI A11 soinfo-pool corruption); API >= 36
+  (Android 16+, incl. Xiaomi 17) now also forbidden — brand-new linker with
+  unverified Dobby patterns + the fdsan trap above. Keyed SOs on API >= 36
+  take the so_plain/lib_mirror plaintext path (ClassLoader pathElements
+  helper-first, DT_NEEDED parent-dir first), identical to API <= 30.
+
+铁律 update: loadLibrary/JNI_OnLoad window = zero dlopen, zero code-section
+writes, zero stdio AND zero fdsan-touching libc calls (open/close/fopen/
+fdopen/fread/fclose) — raw syscalls only.
+
 ## 0.7.3 (hotfix 2026-10-11: no linker code patch on Android 11 — MIUI soinfo corruption)
 
 - **Bug**: Redmi Note 9 Pro (MIUI 12.5.7 / Android 11) cloud test, 2/2 SIGABRT

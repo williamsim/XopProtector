@@ -36,7 +36,16 @@ MapsRawFile* maps_raw_open() {
 
 void maps_raw_close(MapsRawFile* mf) {
     if (mf == nullptr) return;
-    if (mf->fd >= 0) close(mf->fd);
+    // XOP 2026-10-11: libc close() goes through android_fdsan_close_with_tag
+    // which traps via __loader_shared_globals on Android 17 inside the
+    // loadLibrary/JNI_OnLoad window. Raw syscall only.
+    if (mf->fd >= 0) {
+#if defined(__NR_close)
+        syscall(__NR_close, mf->fd);
+#else
+        close(mf->fd);
+#endif
+    }
     delete mf;
 }
 
