@@ -57,6 +57,10 @@ void install_business_so_hooks();
  * decrypt path. MUST be deferred to JNI_OnLoad — patching linker instructions
  * from the shell constructor races with concurrent linker execution on binder
  * threads (MIUI Android 11: SIGSEGV inside linker dlclose logging, 2/2).
+ * On API <= 30 the deferral is still not enough (JPush worker threads race the
+ * patch window: soinfo-pool corruption, generate_handle CHECK abort on Redmi
+ * Note 9 Pro V12.5.7) — there no linker code is patched at all and all keyed
+ * SOs take the so_plain/lib_mirror plaintext path.
  * Idempotent.
  */
 void install_linker_dobby_hooks_deferred();

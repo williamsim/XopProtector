@@ -2496,8 +2496,37 @@ static void hooked_call_constructors(void* soinfo) {
     }
 }
 
+/**
+ * MIUI Android 11 (API 30): Dobby inline-patching live linker code races with
+ * app threads that are already executing the linker. JPush worker threads
+ * (jg_c_net_1) start dlopening within ~150 ms of shell init — the same window
+ * where JNI_OnLoad installs these patches. Torn patches corrupted the linker:
+ *   - Redmi Note 9 Pro (V12.5.7.0.RJSCNXM, 2026-10-11): soinfo pool garbage →
+ *     "generate_handle CHECK 'handle_ == 0' failed" SIGABRT inside a plain
+ *     third-party dlopen through hooked_loader_android_dlopen_ext (2/2).
+ *   - Same device family (2026-09-25, other shell-packed app): init_array
+ *     pointers garbage → SIGILL executing [anon:.bss] inside call_array.
+ * On API <= 30 no linker code patch is allowed at all: extract-inode (L2e)
+ * stays OFF and every keyed SO takes the so_plain/lib_mirror plaintext path
+ * (ClassLoader pathElements are helper-first, and DT_NEEDED resolves in the
+ * parent lib's directory first, so plaintext children are found there).
+ */
+static bool linker_inline_patch_forbidden() {
+#if defined(__ANDROID__)
+    return android_get_device_api_level() <= 30;
+#else
+    return false;
+#endif
+}
+
 static void install_linker_extract_hooks() {
     if (g_extract_inode_hooks_ok.load(std::memory_order_acquire)) return;
+    if (linker_inline_patch_forbidden()) {
+        xop_so_log(ANDROID_LOG_WARN,
+                   "[XOP-SO] API<=30: linker inline hooks disabled — so_plain path-load only");
+        PLOGE("business so: linker inline hooks disabled (API<=30 MIUI dlopen corruption)");
+        return;
+    }
     LinkerInfo li{};
     if (!find_linker_info(&li) || li.path[0] == 0) {
         PLOGW("business so: linker not found — extract-inode decrypt disabled");
@@ -5817,16 +5846,21 @@ static void install_linker_open_hooks() {
     any |= hook_linker_import(li.path, "openat64", reinterpret_cast<void*>(fake_openat));
     any |= hook_linker_import(li.path, "open64", reinterpret_cast<void*>(fake_open));
 
-    const char* defined_syms[] = {"openat", "__openat", nullptr};
-    for (int i = 0; defined_syms[i] != nullptr; i++) {
-        void* addr = resolve_linker_symbol(li.path, li.load_bias, defined_syms[i], nullptr);
-        if (addr == nullptr) continue;
-        int rc = DobbyHook(addr, reinterpret_cast<dobby_dummy_func_t>(hooked_linker_openat4),
-                           reinterpret_cast<dobby_dummy_func_t*>(&g_orig_linker_openat4));
-        if (rc == 0) {
-            any = true;
-            PLOGI("business so: linker %s DobbyHook path=%s", defined_syms[i], li.path);
-            break;
+    // Dobby inline fallback is forbidden on API <= 30 (see
+    // linker_inline_patch_forbidden): patch_got_slot below rewrites a pointer
+    // cell only, which is concurrency-safe.
+    if (!linker_inline_patch_forbidden()) {
+        const char* defined_syms[] = {"openat", "__openat", nullptr};
+        for (int i = 0; defined_syms[i] != nullptr; i++) {
+            void* addr = resolve_linker_symbol(li.path, li.load_bias, defined_syms[i], nullptr);
+            if (addr == nullptr) continue;
+            int rc = DobbyHook(addr, reinterpret_cast<dobby_dummy_func_t>(hooked_linker_openat4),
+                               reinterpret_cast<dobby_dummy_func_t*>(&g_orig_linker_openat4));
+            if (rc == 0) {
+                any = true;
+                PLOGI("business so: linker %s DobbyHook path=%s", defined_syms[i], li.path);
+                break;
+            }
         }
     }
 
@@ -6017,10 +6051,13 @@ void install_linker_dobby_hooks_deferred() {
     static std::once_flag once;
     std::call_once(once, []() {
         // Called from JNI_OnLoad: the outer dlopen has fully completed and the
-        // linker is quiescent on this thread. Binder threads may still run
-        // linker code concurrently, but Dobby patching here happens after
-        // loadLibrary (not during it), which avoids the MIUI Android 11
-        // torn-patch race seen with constructor-time installation.
+        // linker is quiescent on this thread. On API >= 31 this deferral is
+        // enough (Huawei Android 12 verified). On API <= 30 (MIUI 12.5) it is
+        // NOT: app worker threads (JPush jg_c_net_1) start dlopening within
+        // ~150 ms of shell init and race the patch writes — see
+        // linker_inline_patch_forbidden(). There install_linker_extract_hooks
+        // is a no-op and install_linker_open_hooks falls back to GOT pointer
+        // patches only, so no linker instruction bytes are ever modified.
         PLOGI("business so: deferred linker Dobby hooks install (JNI_OnLoad)");
         install_linker_extract_hooks();
         install_linker_open_hooks();

@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.7.3 (hotfix 2026-10-11: no linker code patch on Android 11 — MIUI soinfo corruption)
+
+- **Bug**: Redmi Note 9 Pro (MIUI 12.5.7 / Android 11) cloud test, 2/2 SIGABRT
+  ~150 ms after shell init: `linker_soinfo.cpp:879: generate_handle CHECK
+  'handle_ == 0' failed` inside a plain third-party `dlopen` (JPush
+  `jg_c_net_1` thread loading its native lib). Backtrace goes
+  `android_dlopen_ext → protector::so::hooked_loader_android_dlopen_ext →
+  soinfo_alloc → generate_handle`. Same device family showed the same disease
+  a month earlier (2026-09-25, another shell-packed app): SIGILL executing
+  garbage in `[anon:.bss]` from `call_array` during a JPush dlopen.
+- **Root cause**: `soinfo_alloc` memsets the fresh soinfo and immediately
+  calls `generate_handle`; nothing in-thread can set `handle_` in between, so
+  the soinfo pool (linker `.bss`) was corrupted concurrently. The corrupting
+  writer: Dobby inline patches of linker code (`call_constructors`, `mmap`,
+  `mmap64`, `__loader_android_dlopen_ext`, `openat`) installed at JNI_OnLoad —
+  JPush worker threads are already hot on `dlopen` at that instant, so the
+  patch window races live linker execution. This is the same corruption class
+  as the 0.7.2 Mi 10 Lite Zoom SIGSEGV; deferring installation to JNI_OnLoad
+  narrowed but did not close the race window.
+- **Fix**: on API <= 30 the shell never modifies linker instruction bytes:
+  - `install_linker_extract_hooks` is a no-op (`g_extract_inode_hooks_ok`
+    stays false → L2e extract-inode in-memory decrypt disabled);
+  - `install_linker_open_hooks` keeps only GOT pointer-cell patches
+    (`patch_got_slot`), the Dobby inline fallback is skipped.
+  Keyed SOs take the so_plain/lib_mirror plaintext path (ClassLoader
+  pathElements are helper-first; DT_NEEDED resolves in the parent lib's
+  directory first, where materialized plaintext copies live).
+- Rule: **on Android 11 and below, patch linker state with pointer writes
+  only (bytehook GOT); never inline-patch linker code while the process is
+  live.** API >= 31 keeps the JNI_OnLoad-deferred Dobby hooks (Huawei
+  Android 12 verified).
+
 ## 0.7.2 (hotfix 2026-10-10: MIUI Android 11 startup livelock)
 
 - **Bug**: On Redmi Note 8 Pro (MIUI 12.5 / Android 11), the protected app hung
